@@ -14,6 +14,7 @@
  *   resize       表示制御チャネルでの大きさ・拡大率の変更に、画面とストリームが追従する
  *   audio        Mac で鳴らした正弦波が、崩れずに（周波数・SN 比・途切れ）届く
  *   reconnect    きれいな切断・強制切断のあと、同じ仮想ディスプレイを使い回して何度でもつなげる
+ *   takeover     前の接続が残ったまま新しい接続が来ると、新しい方に切り替わる
  *   rescale      つなぎ直したときに頼んだ拡大率（Retina / 等倍）が反映される
  *   idle         放置すると仮想ディスプレイを解放してプロセスが終わり、launchd が起動し直す。その後もつながる
  *
@@ -531,7 +532,9 @@ async function main() {
   await test("resize", "表示制御チャネルでの大きさ・拡大率の変更に追従する", async () => {
     const c = await connect(2560, 1600, 200);
     try {
-      const steps: [number, number, number][] = [[1920, 1200, 200], [1600, 1000, 100], [2732, 2048, 200], [2560, 1600, 200]];
+      const steps: [number, number, number][] = [
+        [1920, 1200, 200], [1600, 1000, 100], [3840, 2160, 300], [2732, 2048, 200], [2560, 1600, 200],
+      ];
       const done: string[] = [];
       for (const [w, h, scale] of steps) {
         const from = c.events.length;
@@ -603,8 +606,29 @@ async function main() {
   });
 
   await settle();
+  await test("takeover", "前の接続が残ったまま新しい接続が来ると、新しい方に切り替わる", async () => {
+    // 通信が途切れた iPhone がつなぎ直すとき、サーバはまだ前の接続を生きていると思っている
+    const a = await connect(2560, 1600, 200);
+    const pid = await listenerPid();
+    const b = await connect(3840, 2160, 300);
+    const gone = await Promise.race([a.status.then(() => true), sleep(10000).then(() => false)]);
+    expect(gone, "前の接続が切られていない");
+    const d = await expectVirtualDisplay(3840, 2160, true);
+    if (displayId) expect(d.id === displayId, "仮想ディスプレイが使い回されていない", { before: displayId, now: d.id });
+    await expectPointer(b, d, 1920, 1080);
+    const s = await b.stats();
+    expect((s.frames as number) > 0 && (s.lit as number) > 0.05, "新しい接続に画面が届いていない", s);
+    await b.quit();
+    expect((await listenerPid()) === pid, "サーバのプロセスが変わった（落ちた）");
+    return `${d.w}x${d.h}pt・ディスプレイ ${d.id}`;
+  });
+
+  await settle();
   await test("rescale", "つなぎ直したときに頼んだ拡大率（Retina / 等倍）が反映される", async () => {
-    const steps: [number, number, number][] = [[2560, 1600, 200], [1600, 1000, 100], [2560, 1600, 200], [1920, 1200, 150]];
+    // 3840x2160@300% は iPhone から mRemote で 4K 固定にしたときの頼み方
+    const steps: [number, number, number][] = [
+      [2560, 1600, 200], [1600, 1000, 100], [3840, 2160, 300], [2560, 1600, 200], [1920, 1200, 150],
+    ];
     const done: string[] = [];
     for (const [w, h, scale] of steps) {
       const c = await connect(w, h, scale);
