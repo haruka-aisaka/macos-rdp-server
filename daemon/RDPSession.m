@@ -603,13 +603,21 @@ static void rdp_on_keyframe_request(void *ud) {
      * being drawn small. */
     uint32_t scale = freerdp_settings_get_uint32(_peer->context->settings, FreeRDP_DesktopScaleFactor);
     if ([self wantsVirtualDisplay]) {
-        _display = [[VirtualDisplay alloc] initWithWidth:width height:height
-                                                   hiDPI:[self wantsHiDPIForScale:scale]];
-        if (![_display create]) {
-            rdp_verbose("VirtualDisplay unavailable, falling back to main display");
-            _display = nil;
+        BOOL hidpi = [self wantsHiDPIForScale:scale];
+        VirtualDisplay *kept = [VirtualDisplay reusable];
+        if (kept.displayID && [kept reconfigureWidth:width height:height hiDPI:hidpi]) {
+            _display = kept;
+            [_display makeMain];
+            rdp_info("reusing virtual display %u from the previous session", _display.displayID);
         } else {
-            rdp_verbose("VirtualDisplay created: displayID=%u", _display.displayID);
+            _display = [[VirtualDisplay alloc] initWithWidth:width height:height hiDPI:hidpi];
+            if (![_display create]) {
+                rdp_verbose("VirtualDisplay unavailable, falling back to main display");
+                _display = nil;
+            } else {
+                rdp_verbose("VirtualDisplay created: displayID=%u", _display.displayID);
+                if (_display.isVirtual) [VirtualDisplay setReusable:_display];
+            }
         }
     }
     /* On the main display the client's size stays as it is: the picture is fitted
@@ -795,7 +803,10 @@ static void rdp_on_keyframe_request(void *ud) {
     }
     [_clipboard stop];
     [_displayControl stop];
-    [_display destroy];
+    if (_display && _display == [VirtualDisplay reusable])
+        rdp_info("keeping virtual display %u for the next session", _display.displayID);
+    else
+        [_display destroy];
     [_mainMode restore];
 
     if (_peer) { rdp_peer_destroy(_peer); _peer = NULL; }

@@ -58,6 +58,24 @@
 
 - (BOOL)hiDPI { return _hidpi; }
 
+- (BOOL)isVirtual {
+#if MACOS_RDP_VIRTUAL_DISPLAY
+    return _vdObject != nil;
+#else
+    return NO;
+#endif
+}
+
+static VirtualDisplay *gReusable;
+
++ (nullable VirtualDisplay *)reusable {
+    @synchronized(self) { return gReusable; }
+}
+
++ (void)setReusable:(nullable VirtualDisplay *)display {
+    @synchronized(self) { gReusable = display; }
+}
+
 - (CGDirectDisplayID)displayID { return _did; }
 - (uint32_t)width              { return _w; }
 - (uint32_t)height             { return _h; }

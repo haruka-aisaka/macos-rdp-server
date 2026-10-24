@@ -150,7 +150,8 @@ daemon は動いている間 Mac をスリープさせず、ディスプレイ�
 | `RDP_MAX_FPS` | `30` | フレームレートの上限（1〜120）。MACRDPX クライアントはセッションごとに変えられます |
 | `RDP_BITRATE_KBPS` | `8000` | H.264 の目標ビットレート。同じく MACRDPX クライアントはセッションごとに変えられます |
 | `RDP_GFX_CODEC` | `auto` | 画面のコーデック。`auto`: クライアントが受け付ければ H.264 (AVC420)、受け付けなければ RemoteFX Progressive（iPhone の Windows App など）。`avc`、`progressive`、`planar` で固定（テスト用） |
-| `RDP_DISPLAY_MODE` | `main` | `main` は Mac のメインディスプレイを表示。`virtual` はセッションごとにクライアントに合わせたサイズの専用ディスプレイを用意 |
+| `RDP_DISPLAY_MODE` | `main` | `main` は Mac のメインディスプレイを表示。`virtual` はクライアントに合わせたサイズの専用ディスプレイを用意（再接続では同じものを引き継ぐ） |
+| `RDP_VIRTUAL_DISPLAY_KEEP` | `300` | `virtual` のとき、セッションが終わってから再接続を待って専用ディスプレイを残しておく秒数。過ぎたら解放し、エージェントを起動し直す |
 | `RDP_MATCH_RESOLUTION` | `1` | メインディスプレイの場合。`1`: Mac の解像度をクライアントにいちばん近い表示モードに切り替える。`0`: 変えない |
 | `RDP_HIDPI` | auto | `auto`: クライアントのスケールが 150 % 以上なら HiDPI の仮想ディスプレイ。`0`: 使わない。`1`: 常に使う |
 | `RDP_DISP` | on | `0` でディスプレイ制御を無効化（デスクトップは接続時のサイズのまま） |

@@ -1,5 +1,6 @@
 #import "daemon/RDPServer.h"
 #import "daemon/RDPSession.h"
+#import "display/VirtualDisplay.h"
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
@@ -20,6 +21,8 @@
  * @synchronized(self) along with `sessions`. A new client that authenticates
  * supersedes whatever is here. */
 @property (nonatomic, strong, nullable) RDPSession *activeSession;
+/* Bumped by every session that ends, so only the last idle timer acts. */
+@property (nonatomic, assign) uint64_t idleGeneration;
 @end
 
 /* Process-wide active-session flag. The daemon runs a single RDPServer, so a
@@ -220,6 +223,41 @@ static _Atomic int32_t g_hasActiveSession = 0;
     }
     rdp_debug("session removed; %lu remaining", (unsigned long)_sessions.count);
     [self.delegate serverSession:session didEndWithError:error];
+    [self scheduleVirtualDisplayRelease];
+}
+
+/* The virtual display outlives its session so a reconnect can take it over (a
+ * second one would not come online in this process — see VirtualDisplay.h).
+ * Once no client has come back for RDP_VIRTUAL_DISPLAY_KEEP seconds (default
+ * 300; 0 = right away), release it and, under launchd, exit: launchd starts a
+ * fresh daemon whose first virtual display works again. */
+- (void)scheduleVirtualDisplayRelease {
+    if (![VirtualDisplay reusable]) return;
+    const char *env = getenv("RDP_VIRTUAL_DISPLAY_KEEP");
+    long keep = env && *env ? strtol(env, NULL, 10) : 300;
+    if (keep < 0) keep = 0;
+    uint64_t generation;
+    @synchronized(self) { generation = ++_idleGeneration; }
+    rdp_info("virtual display kept for %ld s for a reconnect", keep);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)keep * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        @synchronized(self) {
+            if (generation != self->_idleGeneration || self->_activeSession || self->_sessions.count) return;
+            /* Claim the release while holding the lock, so a client accepted now
+             * is not handed a display that is going away. */
+            self->_running = NO;
+        }
+        VirtualDisplay *vd = [VirtualDisplay reusable];
+        [VirtualDisplay setReusable:nil];
+        rdp_info("no client for %ld s: releasing virtual display %u", keep, vd.displayID);
+        [vd destroy];
+        if (getenv("XPC_SERVICE_NAME")) {   /* started by launchd, which starts a new one */
+            rdp_info("restarting for a fresh virtual display");
+            [self stop];
+            exit(0);
+        }
+        @synchronized(self) { self->_running = YES; }
+    });
 }
 
 @end
