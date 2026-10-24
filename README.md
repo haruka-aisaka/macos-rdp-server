@@ -157,6 +157,7 @@ Settings are environment variables passed to `macos-rdp-install-user` (see
 | Variable | Default | Description |
 |---|---|---|
 | `RDP_PORT` | `3389` | TCP port to listen on |
+| `RDP_LISTEN_ADDRESS` | all | Listen on this address only (IPv4 or IPv6), e.g. the Mac's Tailscale address to keep the port off the LAN |
 | `RDP_LOG_LEVEL` | `info` | `error`, `info`, `verbose` or `debug` (see below) |
 | `RDP_KEYBOARD_TYPE` | auto | `jis`, `ansi`, `iso` or `auto`; see [docs/JAPANESE-SETUP.md](docs/JAPANESE-SETUP.md) |
 | `RDP_MAX_FPS` | `30` | Frame-rate cap (1–120); a MACRDPX client may change it per session |

@@ -145,6 +145,7 @@ daemon は動いている間 Mac をスリープさせず、ディスプレイ�
 | 変数 | 既定値 | 説明 |
 |---|---|---|
 | `RDP_PORT` | `3389` | 待ち受ける TCP ポート |
+| `RDP_LISTEN_ADDRESS` | すべて | このアドレス（IPv4 か IPv6）だけで待ち受ける。Mac の Tailscale のアドレスにすると、LAN からは繋がらなくなる |
 | `RDP_LOG_LEVEL` | `info` | `error`、`info`、`verbose`、`debug`（後述） |
 | `RDP_KEYBOARD_TYPE` | auto | `jis`、`ansi`、`iso`、`auto`。[docs/JAPANESE-SETUP.md](docs/JAPANESE-SETUP.md) を参照 |
 | `RDP_MAX_FPS` | `30` | フレームレートの上限（1〜120）。MACRDPX クライアントはセッションごとに変えられます |

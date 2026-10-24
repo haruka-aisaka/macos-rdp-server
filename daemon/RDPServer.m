@@ -82,6 +82,29 @@ static _Atomic int32_t g_hasActiveSession = 0;
     addr.sin6_port   = htons(_portValue);
     addr.sin6_addr   = in6addr_any;
 
+    /* RDP_LISTEN_ADDRESS: listen on one address only (an IPv4 or IPv6
+     * literal), e.g. 127.0.0.1, or the Mac's Tailscale address so the port is
+     * not reachable from the LAN. Unset: every address. */
+    const char *listenAddress = getenv("RDP_LISTEN_ADDRESS");
+    if (listenAddress && *listenAddress) {
+        struct in_addr v4;
+        if (inet_pton(AF_INET6, listenAddress, &addr.sin6_addr) == 1) {
+            /* as given */
+        } else if (inet_pton(AF_INET, listenAddress, &v4) == 1) {
+            /* IPv4 on the dual-stack socket: the v4-mapped address ::ffff:a.b.c.d */
+            memset(&addr.sin6_addr, 0, sizeof(addr.sin6_addr));
+            addr.sin6_addr.s6_addr[10] = 0xff;
+            addr.sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&addr.sin6_addr.s6_addr[12], &v4, sizeof(v4));
+        } else {
+            rdp_error("RDP_LISTEN_ADDRESS '%s' is not an IP address", listenAddress);
+            if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EINVAL userInfo:nil];
+            close(fd);
+            return NO;
+        }
+        rdp_info("listening on %s only", listenAddress);
+    }
+
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         rdp_error("bind() failed on port %u: %s", _portValue, strerror(errno));
         if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
