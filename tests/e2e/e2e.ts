@@ -18,6 +18,7 @@
  *   reconnect    きれいな切断・強制切断のあと、同じ仮想ディスプレイを使い回して何度でもつなげる
  *   takeover     前の接続が残ったまま新しい接続が来ると、新しい方に切り替わる
  *   rescale      つなぎ直したときに頼んだ拡大率（Retina / 等倍）が反映される
+ *   bitmap-resize H.264 を使わないクライアントで、送信中に大きさを続けて変えても落ちない
  *   idle         放置すると仮想ディスプレイを解放してプロセスが終わり、launchd が起動し直す。その後もつながる
  *
  * 前提: brew install freerdp（クライアントとして使うだけ）。Deno。
@@ -137,7 +138,7 @@ class Client {
   private waiters: { pred: (e: Event) => boolean; resolve: (e: Event) => void }[] = [];
   readonly done: Promise<void>;
 
-  constructor(opts: { width: number; height: number; scale: number; audio?: string }) {
+  constructor(opts: { width: number; height: number; scale: number; audio?: string; gfx?: string }) {
     const argv = [];
     if (opts.audio) argv.push("--audio", opts.audio);
     argv.push(
@@ -149,7 +150,7 @@ class Client {
       "/cert:ignore",
       `/size:${opts.width}x${opts.height}`,
       `/scale-desktop:${opts.scale}`,
-      "/gfx:AVC420",
+      opts.gfx ?? "/gfx:AVC420",
       "/dynamic-resolution",
       "/sound:sys:e2e",
       "/log-level:ERROR",
@@ -236,8 +237,8 @@ class Client {
   }
 }
 
-async function connect(width: number, height: number, scale: number, audio?: string): Promise<Client> {
-  const client = new Client({ width, height, scale, audio });
+async function connect(width: number, height: number, scale: number, audio?: string, gfx?: string): Promise<Client> {
+  const client = new Client({ width, height, scale, audio, gfx });
   const first = await Promise.race([
     client.wait((e) => e.ev === "connected" || e.ev === "connect-failed", "接続", 20000),
     client.status.then((s) => ({ ev: "exited", code: s.code } as Event)),
@@ -340,11 +341,15 @@ function expect(ok: unknown, message: string, detail?: unknown) {
   if (!ok) throw new Failure(`${message}${detail === undefined ? "" : `: ${JSON.stringify(detail)}`}`);
 }
 
-/** 仮想ディスプレイが 1 枚、頼んだ画素数・密度で、メインになっていること */
-async function expectVirtualDisplay(width: number, height: number, hidpi: boolean): Promise<Display> {
+/**
+ * 仮想ディスプレイが 1 枚、頼んだ画素数・密度で、メインになっていること。
+ * hidpi が null なら密度は問わない（macOS が Retina を出さない大きさがある）
+ */
+async function expectVirtualDisplay(width: number, height: number, hidpi: boolean | null): Promise<Display> {
   const d = await waitFor(`仮想ディスプレイ ${width}x${height}${hidpi ? " Retina" : ""}`, async () => {
     const vds = await virtualDisplays();
-    return vds.length === 1 && vds[0].pw === width && vds[0].ph === height && vds[0].hidpi === hidpi && vds[0];
+    return vds.length === 1 && vds[0].pw === width && vds[0].ph === height &&
+      (hidpi === null || vds[0].hidpi === hidpi) && vds[0];
   }, 15000).catch(async (e) => {
     throw new Failure(`${(e as Error).message}\n  いまの画面: ${JSON.stringify((await probe()).displays)}`);
   });
@@ -647,6 +652,36 @@ async function main() {
       await settle();
     }
     return done.join(" → ");
+  });
+
+  await settle();
+  await test("bitmap-resize", "H.264 を使わないクライアント（Progressive）で、送信中に大きさを続けて変えても落ちない", async () => {
+    // Windows App for iPhone のように AVC を断るクライアントは、タイルの差分で送る経路に乗る
+    const gfx = "/gfx:progressive:on,AVC420:off,AVC444:off";
+    const pid = await listenerPid();
+    const c = await connect(1920, 1200, 200, undefined, gfx);
+    try {
+      expect(/GFX codec: progressive/.test(await serverLog()), "Progressive の経路になっていない");
+      const sizes: [number, number][] = [[1600, 1000], [2560, 1600], [1280, 800], [1920, 1200], [2400, 1500], [1366, 768]];
+      // 画面が動いているときに送信と重なるよう、ポインタを動かしながら間を空けずに頼む
+      for (let round = 0; round < 3; round++) {
+        for (const [w, h] of sizes) {
+          await c.send(`resize ${w} ${h} 200`);
+          await c.send(`mouse ${Math.round(w / 3)} ${Math.round(h / 3)}`);
+          await sleep(120);
+        }
+      }
+      const [w, h] = sizes[sizes.length - 1];
+      await c.waitForPicture(w, h);
+      // 1366x768 の Retina（683x384 ポイント）は macOS が使わせないので、等倍でよい。画素数はストリームと同じこと
+      const d = await expectVirtualDisplay(w, h, null);
+      await expectPointer(c, d, Math.round(w / 2), Math.round(h / 3));
+      expect((await listenerPid()) === pid, "サーバのプロセスが変わった（落ちた）", { pid, now: await listenerPid() });
+      const s = await c.stats();
+      return `${sizes.length * 3} 回の変更のあと ${s.w}x${s.h}・フレーム ${s.frames}`;
+    } finally {
+      await c.quit();
+    }
   });
 
   await settle();

@@ -6,7 +6,7 @@
 // クライアントの画面にこれがどう映るかで、映っているか・どこまで見えているか・向きを確かめる。
 // 真ん中の入力欄（英字の入力ソースだけ）に打たれた文字を typed.txt に、クリックの位置を
 // clicks.txt（画面全体の座標、ポイント、左上が原点）に書く。画面の構成が変わったら覆い直す。
-// 覆っている範囲は frame.json に書く。
+// 覆っている範囲は frame.json に、前面かどうか（とそのときの前面のアプリ）は status.json に書く。
 import AppKit
 
 let directory = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "/tmp/rdp-e2e/target")
@@ -77,8 +77,22 @@ final class TargetView: NSView {
     }
 }
 
+/// 選ばれるたびに英字の入力ソースだけにする入力欄。日本語入力が有効だと、打った文字が未確定のまま
+/// 残って入力欄の文字にならない（クリックし直すと新しい編集が始まり、制限が外れる）
+final class RomanField: NSTextField {
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        restrictToRoman()
+        return became
+    }
+
+    func restrictToRoman() {
+        (currentEditor() as? NSTextView)?.inputContext?.allowedInputSourceLocales = [NSAllRomanInputSourcesLocaleIdentifier]
+    }
+}
+
 final class TargetWindow: NSWindow, NSTextFieldDelegate {
-    let field = NSTextField()
+    let field = RomanField()
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -125,17 +139,23 @@ write("typed.txt", "")
 write("clicks.txt", "")
 window.cover()
 window.makeKeyAndOrderFront(nil)
-// 日本語入力が有効でも、英字のまま入るように
-window.field.currentEditor()
 window.makeFirstResponder(window.field)
-if let editor = window.field.currentEditor() as? NSTextView {
-    editor.inputContext?.allowedInputSourceLocales = [NSAllRomanInputSourcesLocaleIdentifier]
-}
 app.activate(ignoringOtherApps: true)
 NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
     window.cover()
     window.makeKeyAndOrderFront(nil)
     app.activate(ignoringOtherApps: true)
+}
+// キーが入力欄に届くのは、このアプリが前面で入力欄がキーを受けているときだけ。
+// 通知の確認パネルなどに前面を取られると届かないので、テストが確かめられるように書いておく
+Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+    let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+    let editing = window.firstResponder === window.field.currentEditor()
+    if editing { window.field.restrictToRoman() }
+    write("status.json", """
+    {"active":\(app.isActive),"key":\(window.isKeyWindow),"editing":\(editing),"front":"\(front.replacingOccurrences(of: "\"", with: ""))"}
+
+    """)
 }
 signal(SIGTERM) { _ in exit(0) }
 app.run()
