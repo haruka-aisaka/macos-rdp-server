@@ -1,6 +1,8 @@
 // e2e-target: クライアントの E2E テストで、Mac の画面いっぱいに出す「目印の窓」。
 //
-//   e2e-target <出力ディレクトリ>
+//   e2e-target <出力ディレクトリ> [--animate]
+//
+// --animate: 真ん中を、色の変わる四角が 30 コマ/秒で動き続ける（動きのある画面の通信量を測るため）。
 //
 // メインの画面（RDP の仮想ディスプレイ）を覆い、決まった色の背景と四隅の色付きの四角を描く。
 // クライアントの画面にこれがどう映るかで、映っているか・どこまで見えているか・向きを確かめる。
@@ -40,10 +42,20 @@ func globalTopLeft(_ point: NSPoint) -> CGPoint {
 
 final class TargetView: NSView {
     override var isFlipped: Bool { true }
+    /// --animate のときに進む
+    var tick = 0
 
     override func draw(_ dirtyRect: NSRect) {
         Palette.background.setFill()
         bounds.fill()
+        if CommandLine.arguments.contains("--animate") {
+            let side = min(bounds.width, bounds.height) * 0.25
+            let span = bounds.width - side
+            let phase = Double(tick % 120) / 120
+            let x = span * (phase < 0.5 ? phase * 2 : (1 - phase) * 2)
+            NSColor(hue: CGFloat(tick % 90) / 90, saturation: 0.8, brightness: 0.9, alpha: 1).setFill()
+            NSRect(x: x, y: bounds.height * 0.2, width: side, height: side).fill()
+        }
         let side = (min(bounds.width, bounds.height) * 0.15).rounded()
         let corners: [(NSColor, NSRect)] = [
             (Palette.topLeft, NSRect(x: 0, y: 0, width: side, height: side)),
@@ -156,6 +168,12 @@ Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
     {"active":\(app.isActive),"key":\(window.isKeyWindow),"editing":\(editing),"front":"\(front.replacingOccurrences(of: "\"", with: ""))"}
 
     """)
+}
+if CommandLine.arguments.contains("--animate"), let view = window.contentView as? TargetView {
+    Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { _ in
+        view.tick += 1
+        view.needsDisplay = true
+    }
 }
 signal(SIGTERM) { _ in exit(0) }
 app.run()

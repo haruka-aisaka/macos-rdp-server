@@ -15,6 +15,7 @@
  *   connect      接続して画面が届く。Retina の仮想ディスプレイがメインになる。ポインタが狙った所へ行く
  *   resize       表示制御チャネルでの大きさ・拡大率の変更に、画面とストリームが追従する
  *   audio        Mac で鳴らした正弦波が、崩れずに（周波数・SN 比・途切れ）届く
+ *   audio-silence 音が止まったら音声を送らず、次に鳴った音は欠けずに届く
  *   reconnect    きれいな切断・強制切断のあと、同じ仮想ディスプレイを使い回して何度でもつなげる
  *   takeover     前の接続が残ったまま新しい接続が来ると、新しい方に切り替わる
  *   rescale      つなぎ直したときに頼んだ拡大率（Retina / 等倍）が反映される
@@ -371,7 +372,8 @@ async function expectPointer(client: Client, display: Display, x: number, y: num
   await waitFor(`ポインタ (${want.x}, ${want.y})`, async () => {
     const m = (await probe()).mouse;
     return Math.abs(m.x - want.x) <= 1.5 && Math.abs(m.y - want.y) <= 1.5;
-  }, 5000).catch(async () => {
+    // 画面の構成が変わった直後は、構成を読むだけで数秒かかることがある
+  }, 15000).catch(async () => {
     throw new Failure(`ポインタが ${JSON.stringify(want)} に来ない（いま ${JSON.stringify((await probe()).mouse)}）`);
   });
 }
@@ -590,6 +592,39 @@ async function main() {
     expect(report.dropouts === 0, "途中で音が抜けている", report);
     expect(report.peak > 0.4 && report.peak < 0.6, "振幅が元（0.5）と違う", report);
     return `${format.rate}Hz ${format.channels}ch・${report.frequency.toFixed(2)}Hz・SN 比 ${report.snrDb.toFixed(1)}dB・${report.seconds.toFixed(1)}秒`;
+  });
+
+  await settle();
+  await test("audio-silence", "音が止まったら音声を送らず、次に鳴った音は欠けずに届く", async () => {
+    const wav = `${WORK}/tone.wav`, raw = `${WORK}/audio-silence.raw`;
+    await writeToneWav(wav);
+    const c = await connect(1920, 1200, 200, raw);
+    let format: Event;
+    let silentBytes = 0, before = 0;
+    try {
+      await sleep(1000);
+      await run("afplay", [wav]);
+      format = await c.wait((e) => e.ev === "audio-format", "音声の形式", 5000);
+      await sleep(2000); // 鳴り終わりの余韻（0.5 秒）が送られ終わるまで
+      const a = (await c.stats()).audioBytes as number;
+      await sleep(5000);
+      before = (await c.stats()).audioBytes as number;
+      silentBytes = before - a;
+      log(`無音の 5 秒に届いた音声: ${silentBytes} バイト`);
+      await run("afplay", [wav]);
+      await sleep(1500);
+    } finally {
+      await c.quit();
+    }
+    // 非圧縮 44.1kHz ステレオなら 5 秒で約 880KB
+    expect(silentBytes < 20000, "無音の間も音声を送っている", { silentBytes });
+    const all = await Deno.readFile(raw);
+    const report = analyzeTone(all.subarray(before - (before % 4)), format.rate as number, format.channels as number);
+    log(`2 回目の音: ${JSON.stringify(report)}`);
+    expect(report.seconds > TONE_SECONDS - 0.5, "2 回目の音が欠けている（鳴り始めが遅れた）", report);
+    expect(Math.abs(report.frequency - TONE_HZ) < TONE_HZ * 0.005 && report.snrDb > 35 && report.dropouts === 0,
+      "2 回目の音が崩れている", report);
+    return `無音 5 秒で ${silentBytes} バイト・2 回目 ${report.seconds.toFixed(1)} 秒・SN 比 ${report.snrDb.toFixed(1)}dB`;
   });
 
   await settle();
