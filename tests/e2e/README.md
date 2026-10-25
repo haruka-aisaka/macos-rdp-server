@@ -6,6 +6,8 @@
 brew install freerdp   # テスト用クライアントを作るためだけに使う
 deno run -A tests/e2e/e2e.ts                  # 全部
 deno run -A tests/e2e/e2e.ts --only audio,idle
+deno run -A tests/e2e/e2e.ts --serve [--keep 秒] [--log debug] [--env RDP_DISP=0]   # サーバだけ起動して残す（クライアントの E2E 用）
+deno run -A tests/e2e/e2e.ts --stop
 ```
 
 - 本番の LaunchAgent（`com.macosrdp.agent`、3389）は止めない。同じバイナリを別のラベル

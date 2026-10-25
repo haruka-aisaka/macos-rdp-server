@@ -3,7 +3,7 @@
  * macos-rdp-server の E2E テスト（この Mac の中だけで完結する）。
  *
  *   deno run -A tests/e2e/e2e.ts [--only 名前,名前] [--keep-server]
- *   deno run -A tests/e2e/e2e.ts --serve [--keep 秒] [--log debug]   テスト用サーバを起動して残す（クライアントの E2E 用）
+ *   deno run -A tests/e2e/e2e.ts --serve [--keep 秒] [--log debug] [--env K=V]...   テスト用サーバを起動して残す（クライアントの E2E 用）
  *   deno run -A tests/e2e/e2e.ts --stop                テスト用サーバを止める
  *
  * いま入っているサーバ（~/.macos-rdp/bin/macos-rdp-daemon）を、本番の LaunchAgent とは別のラベル
@@ -276,6 +276,12 @@ function plist(): string {
     RDP_VIRTUAL_DISPLAY_KEEP: String(KEEP),
     RDP_AUDIO_LOCAL: "0", // テストの正弦波をスピーカーから鳴らさない
   };
+  // --env K=V（何度でも）: 足す・上書きする設定。RDP_DISP=0 で表示制御チャネルのないサーバにするなど
+  args.forEach((a, i) => {
+    if (a !== "--env") return;
+    const [k, ...v] = args[i + 1].split("=");
+    env[k] = v.join("=");
+  });
   const envXml = Object.entries(env).map(([k, v]) => `\t\t<key>${k}</key>\n\t\t<string>${v}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
