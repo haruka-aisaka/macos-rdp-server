@@ -180,9 +180,12 @@ static id make_mode(uint32_t w, uint32_t h) {
 }
 
 /* Waits for the mode pw x ph points at w x h pixels to be offered, and
- * switches to it. Returns whether the display is in that mode now. */
+ * switches to it. Returns whether the display is in that mode now. A mode
+ * macOS lists but marks unusable for the desktop is never chosen - switching
+ * to one does nothing - and *unusable says that this is why it was not. */
 - (BOOL)selectModeWidth:(uint32_t)w height:(uint32_t)h points:(uint32_t)pw :(uint32_t)ph
-                timeout:(useconds_t)timeout {
+                timeout:(useconds_t)timeout unusable:(BOOL *)unusable {
+    if (unusable) *unusable = NO;
     for (useconds_t waited = 0; waited <= timeout; waited += 100000) {
         CGDisplayModeRef cur = CGDisplayCopyDisplayMode(_did);
         BOOL already = cur && CGDisplayModeGetWidth(cur) == pw && CGDisplayModeGetHeight(cur) == ph &&
@@ -191,18 +194,21 @@ static id make_mode(uint32_t w, uint32_t h) {
         if (already) return YES;
         NSDictionary *opts = @{ (__bridge id)kCGDisplayShowDuplicateLowResolutionModes: @YES };
         NSArray *modes = CFBridgingRelease(CGDisplayCopyAllDisplayModes(_did, (__bridge CFDictionaryRef)opts));
+        BOOL sawUnusable = NO;
         for (id x in modes) {
             CGDisplayModeRef dm = (__bridge CGDisplayModeRef)x;
-            if (CGDisplayModeGetWidth(dm) == pw && CGDisplayModeGetHeight(dm) == ph &&
-                CGDisplayModeGetPixelWidth(dm) == w && CGDisplayModeGetPixelHeight(dm) == h) {
-                CGDisplayConfigRef cfg = NULL;
-                if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
-                    CGConfigureDisplayWithDisplayMode(cfg, _did, dm, NULL);
-                    CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
-                }
-                break;
+            if (CGDisplayModeGetWidth(dm) != pw || CGDisplayModeGetHeight(dm) != ph ||
+                CGDisplayModeGetPixelWidth(dm) != w || CGDisplayModeGetPixelHeight(dm) != h) continue;
+            if (!CGDisplayModeIsUsableForDesktopGUI(dm)) { sawUnusable = YES; continue; }
+            sawUnusable = NO;
+            CGDisplayConfigRef cfg = NULL;
+            if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
+                CGConfigureDisplayWithDisplayMode(cfg, _did, dm, NULL);
+                CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
             }
+            break;
         }
+        if (unusable) *unusable = sawUnusable;
         usleep(100000);   /* the mode list, and the switch, apply asynchronously */
     }
     return NO;
@@ -229,9 +235,31 @@ static id make_mode(uint32_t w, uint32_t h) {
     }
     _w = w; _h = h; _hidpi = hiDPI;
     uint64_t generation = ++_modeGeneration;
-    if ([self selectModeWidth:w height:h points:pw :ph timeout:1000000]) {
+    BOOL unusable = NO;
+    if ([self selectModeWidth:w height:h points:pw :ph timeout:1000000 unusable:&unusable]) {
         rdp_info("virtual display %u: %ux%u pixels as %ux%u points", _did, w, h, pw, ph);
         return YES;
+    }
+    if (hiDPI && unusable) {
+        /* macOS offers Retina only for some sizes of a panel (none, for
+         * instance, at 1600x1000 on one that came up at 1920x1200): it lists
+         * the others but will not switch to them. Waiting for it left the
+         * display at the previous size while the stream had the new one - a
+         * squeezed picture and clicks off target. The size matters more than
+         * the density, so the client's pixels are drawn at 1x instead. The
+         * request is still remembered as Retina, so asking for the same again
+         * changes nothing. */
+        rdp_info("virtual display %u: %ux%u pixels as %ux%u points is not usable - drawing it at 1x",
+                 _did, w, h, pw, ph);
+        if (![self applySettingsWidth:w height:h hiDPI:NO]) {
+            rdp_error("applySettings %ux%u failed", w, h);
+            return NO;
+        }
+        pw = w; ph = h;
+        if ([self selectModeWidth:w height:h points:pw :ph timeout:1000000 unusable:NULL]) {
+            rdp_info("virtual display %u: %ux%u pixels at 1x", _did, w, h);
+            return YES;
+        }
     }
     rdp_info("virtual display %u: %ux%u pixels as %ux%u points not offered yet - switching when it is",
              _did, w, h, pw, ph);
@@ -240,7 +268,7 @@ static id make_mode(uint32_t w, uint32_t h) {
         for (int i = 0; i < 100; i++) {   /* up to ~10 s */
             VirtualDisplay *vd = weak;
             if (!vd || vd->_modeGeneration != generation || !vd->_did) return;   /* superseded */
-            if ([vd selectModeWidth:w height:h points:pw :ph timeout:0]) {
+            if ([vd selectModeWidth:w height:h points:pw :ph timeout:0 unusable:NULL]) {
                 rdp_info("virtual display %u: now %ux%u pixels as %ux%u points", vd->_did, w, h, pw, ph);
                 return;
             }
