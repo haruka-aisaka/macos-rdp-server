@@ -56,10 +56,26 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
     /* Frames copied but not yet sent. Past a second of backlog the link is
      * stalled, and older sound is worth less than a bounded queue. */
     _Atomic uint32_t pendingFrames;
+    /* Frames of digital silence in a row, counted on the IO thread only. Once
+     * an app has opened the output, the tap delivers silence for as long as
+     * the device runs - 1.5 Mbps of zeros - so past a short tail nothing is
+     * sent until sound comes back. */
+    uint64_t silentFrames;
 }
 @end
 @implementation RDPAudioSink
 @end
+
+/* Frames of silence still sent before stopping: a tail, so a sound's end is
+ * not cut and short pauses inside music do not stop and start the stream. */
+static const uint64_t kAudioSilenceTailFrames = 24000;
+
+/* Silence as the mixer delivers it: zeros, or the odd last bit of dither. */
+static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
+    for (uint32_t i = 0; i < frameCount * 2; i++)
+        if (samples[i] > 2 || samples[i] < -2) return NO;
+    return YES;
+}
 
 @interface RDPSession ()
 @property (nonatomic, assign) int fd;
@@ -678,6 +694,25 @@ static void rdp_on_keyframe_request(void *ud) {
             /* No per-buffer logging here: buffers arrive ~100x/sec and flooded the
              * log. AudioCapture itself logs a throttled frame total. */
             if (atomic_load(&sink->pendingFrames) > 48000) return;
+            if (audio_is_silent(samples, frameCount)) {
+                uint64_t before = sink->silentFrames;
+                sink->silentFrames += frameCount;
+                if (sink->silentFrames > kAudioSilenceTailFrames) {
+                    if (before <= kAudioSilenceTailFrames)   /* logged off the IO thread */
+                        dispatch_async(sink->sendQueue, ^{
+                            rdp_verbose("audio silent - not sending until sound comes back");
+                        });
+                    return;
+                }
+            } else {
+                if (sink->silentFrames > kAudioSilenceTailFrames) {
+                    double seconds = sink->silentFrames / 48000.0;
+                    dispatch_async(sink->sendQueue, ^{
+                        rdp_verbose("audio back after %.1f s of silence", seconds);
+                    });
+                }
+                sink->silentFrames = 0;
+            }
             size_t bytes = (size_t)frameCount * 2 * sizeof(int16_t);
             int16_t *copy = (int16_t *)malloc(bytes);
             if (!copy) return;
