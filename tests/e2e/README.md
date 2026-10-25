@@ -22,6 +22,8 @@ deno run -A tests/e2e/e2e.ts --stop
 | connect | 接続して画面が届く（フレーム数・黒くない画素）。Retina の仮想ディスプレイがメインになる。ポインタが狙った点へ行く |
 | resize | 表示制御チャネルで大きさ・拡大率（200% / 100%）を変えると、仮想ディスプレイとストリームが追従する |
 | audio | Mac で鳴らした 997Hz の正弦波が、周波数・SN 比（35dB 超）・途切れなし・振幅で崩れずに届く |
+| audio-silence | 音が止まったあとの 5 秒に音声が流れない（20KB 未満）。次に鳴った音は欠けずに届く |
+| audio-aac | 省データの AAC（テスト用サーバは RDP_AUDIO_AAC=1 で最初から AAC）で、150kbps 未満・周波数・SN 比 30dB 超・途切れなしで届く |
 | reconnect | きれいな切断と強制切断（クライアントを kill）のあと、同じ仮想ディスプレイを使い回してつながる。サーバは落ちない |
 | takeover | 前の接続が残ったまま新しい接続が来ると、前の方が切られて新しい方に画面が届く |
 | rescale | つなぎ直したときに頼んだ拡大率が反映される（Retina ⇄ 等倍、iPhone の 4K 固定 = 3840x2160@300% も） |
@@ -33,6 +35,7 @@ deno run -A tests/e2e/e2e.ts --stop
 - `rdp-e2e-client.c` — 画面を持たない RDP クライアント（Homebrew の FreeRDP 3）。標準入力の命令
   （`stats`・`resize`・`mouse`・`click`・`key`・`unicode`・`shot`・`quit`）を実行し、結果を JSON で返す。
   届いた音は `--audio` のファイルへそのまま書く
+- `tone.ts` — 正弦波の WAV を作り、届いた PCM がその正弦波のままか（周波数・SN 比・途切れ）を調べる。mRemote の E2E も使う
 - `display-probe.swift` — Mac の画面の構成（大きさ・画素数・Retina か・メインか）とポインタの位置を JSON で出す
 - `e2e.ts` — 上の 2 つをビルドし、テスト用サーバを起動して順に確かめる。ログは `/tmp/rdp-e2e/`
 
