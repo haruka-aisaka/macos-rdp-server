@@ -1,6 +1,7 @@
 #define RDP_LOG_COMPONENT "peer"
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
+#include "audio/AACEncoder.h"
 #include "protocol/RDPWebDAV.h"
 #include "audio/AudioInput.h"
 
@@ -205,6 +206,8 @@ static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
     pthread_mutex_init(&c->xportLock, &mattr);
     pthread_mutexattr_destroy(&mattr);
     pthread_mutex_init(&c->layoutLock, NULL);
+    c->aacFormatIndex = -1;
+    atomic_init(&c->audioCompressed, false);
     /* Open the Virtual Channel Manager — all dynamic channels live under it. */
     c->vcm = WTSOpenServerA((LPSTR)peer->context);
     if (!c->vcm || c->vcm == INVALID_HANDLE_VALUE) {
@@ -235,6 +238,8 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
     rdp_gfx_bitmap_encoder_free(c->bitmapEncoder);
     c->bitmapEncoder = NULL;
+    rdp_aac_encoder_free(c->aacEncoder);
+    c->aacEncoder = NULL;
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     /* Audio input (MS-RDPEAI) — close and release the ObjC object. */
@@ -667,6 +672,8 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     if (preferred) {
         for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
             if (rdpsnd->client_formats[i].nSamplesPerSec != preferred) continue;
+            /* The format negotiated is always PCM; AAC is used per wave, on request. */
+            if (rdpsnd->client_formats[i].wFormatTag != WAVE_FORMAT_PCM) continue;
             for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
                 if (audio_format_compatible(&rdpsnd->server_formats[j],
                                             &rdpsnd->client_formats[i])) {
@@ -681,6 +688,7 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     }
     /* Pass 2: first compatible format of any rate. */
     for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
+        if (rdpsnd->client_formats[i].wFormatTag != WAVE_FORMAT_PCM) continue;
         for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
             if (audio_format_compatible(&rdpsnd->server_formats[j],
                                         &rdpsnd->client_formats[i])) {
@@ -718,6 +726,24 @@ static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
         rdp_error("selected_client_format mismatch: passed %d but context holds "
                   "%u — wire wFormatNo would disagree with resample rate!",
                   chosen, (unsigned)committed);
+    }
+
+    /* The private AAC format at the same rate, for saving data. Wave2 PDUs
+     * carry it, which a client before version 8 cannot take. */
+    ctx->aacFormatIndex = -1;
+    for (UINT16 i = 0; i < rdpsnd->num_client_formats; i++) {
+        const AUDIO_FORMAT *cf = &rdpsnd->client_formats[i];
+        if (cf->wFormatTag == RDP_WAVE_FORMAT_MRX_AAC && cf->nSamplesPerSec == sel->nSamplesPerSec &&
+            cf->nChannels == sel->nChannels && rdpsnd->clientVersion >= 0x08 /* Wave2 PDUs, CHANNEL_VERSION_WIN_8 */) {
+            ctx->aacFormatIndex = i;
+            break;
+        }
+    }
+    if (ctx->aacFormatIndex >= 0) {
+        rdp_info("audio: the client takes AAC (idx %d) - used while it saves data", ctx->aacFormatIndex);
+        /* Tests only: AAC from the start, for a client without macrdpx. */
+        const char *force = getenv("RDP_AUDIO_AAC");
+        if (force && strcmp(force, "1") == 0) atomic_store(&ctx->audioCompressed, true);
     }
 
     ctx->audioReady = true;
@@ -958,16 +984,32 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     ctx->rdpsnd = rdpsnd_server_context_new(ctx->vcm);
     if (ctx->rdpsnd) {
         static const UINT32 kRates[] = { 48000, 44100, 22050 };
-        const size_t nFmt = sizeof(kRates) / sizeof(kRates[0]);
+        const size_t nRates = sizeof(kRates) / sizeof(kRates[0]);
+        /* Then the private AAC format (macrdpx AUDIO_AAC) at the two rates a
+         * client plays at, for saving data. A client lists it only if it can
+         * decode it, and it is never the negotiated format: rdpsnd_activated
+         * picks PCM, and AAC goes per wave while the client asks for it. */
+        static const UINT32 kAacRates[] = { 48000, 44100 };
+        const size_t nAac = sizeof(kAacRates) / sizeof(kAacRates[0]);
+        const size_t nFmt = nRates + nAac;
         AUDIO_FORMAT *pcm = (AUDIO_FORMAT *)calloc(nFmt, sizeof(AUDIO_FORMAT));
         if (pcm) {
-            for (size_t k = 0; k < nFmt; k++) {
+            for (size_t k = 0; k < nRates; k++) {
                 pcm[k].wFormatTag      = WAVE_FORMAT_PCM;
                 pcm[k].nChannels       = 2;
                 pcm[k].nSamplesPerSec  = kRates[k];
                 pcm[k].nAvgBytesPerSec = kRates[k] * 2 * 2;
                 pcm[k].nBlockAlign     = 2 * 2;
                 pcm[k].wBitsPerSample  = 16;
+            }
+            for (size_t k = 0; k < nAac; k++) {
+                AUDIO_FORMAT *aac = &pcm[nRates + k];
+                aac->wFormatTag      = RDP_WAVE_FORMAT_MRX_AAC;
+                aac->nChannels       = 2;
+                aac->nSamplesPerSec  = kAacRates[k];
+                aac->nAvgBytesPerSec = 96000 / 8;
+                aac->nBlockAlign     = 1;
+                aac->wBitsPerSample  = 16;
             }
         }
         ctx->rdpsnd->data               = ctx;
@@ -982,7 +1024,7 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
             rdp_verbose("audio channel init failed");
             rdpsnd_server_context_free(ctx->rdpsnd);
             ctx->rdpsnd = NULL;
-        } else { rdp_verbose("audio channel opened (PCM 48000/44100/22050)"); }
+        } else { rdp_verbose("audio channel opened (PCM 48000/44100/22050, AAC 48000/44100)"); }
     }
 
     /* Audio input (MS-RDPEAI mic redirection). Gated behind RDP_AUDIO_INPUT=1.
@@ -1565,10 +1607,42 @@ bool rdp_peer_send_bitmap(freerdp_peer *peer,
     return update->SurfaceBits(update->context, &cmd);
 }
 
+void rdp_peer_set_audio_compressed(freerdp_peer *peer, bool compressed) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    if (atomic_exchange(&ctx->audioCompressed, compressed) != compressed)
+        rdp_info("audio: %s", compressed ? "AAC (the client saves data)" : "PCM");
+}
+
+/* Called on the audio send queue only, which also owns the encoder. */
+static bool send_audio_aac(RDPPeerContext *ctx, const int16_t *samples, uint32_t frame_count) {
+    const AUDIO_FORMAT *format = &ctx->rdpsnd->client_formats[ctx->aacFormatIndex];
+    if (!ctx->aacEncoder) {
+        ctx->aacEncoder = rdp_aac_encoder_new(format->nSamplesPerSec, format->nChannels, 96000);
+        if (!ctx->aacEncoder) return false;
+    }
+    size_t length = 0;
+    const uint8_t *frames = rdp_aac_encoder_encode(ctx->aacEncoder, samples, frame_count, &length);
+    if (!length) return true;   /* still filling a block of 1024 frames */
+    pthread_mutex_lock(&ctx->xportLock);
+    UINT rc = ctx->rdpsnd->SendSamples2(ctx->rdpsnd, (UINT16)ctx->aacFormatIndex, frames, length,
+                                        (UINT16)GetTickCount64(), 0);
+    pthread_mutex_unlock(&ctx->xportLock);
+    return rc == CHANNEL_RC_OK;
+}
+
 bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->rdpsnd || !ctx->audioReady) return false;
+    if (atomic_load(&ctx->audioCompressed) && ctx->aacFormatIndex >= 0) {
+        if (send_audio_aac(ctx, samples, frame_count)) return true;
+        rdp_error("audio: AAC unavailable - sending PCM");
+        atomic_store(&ctx->audioCompressed, false);
+    }
+    if (ctx->aacEncoder) {   /* back to PCM: the next AAC starts afresh */
+        rdp_aac_encoder_free(ctx->aacEncoder);
+        ctx->aacEncoder = NULL;
+    }
     /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature.
      * Audio runs on its own capture thread; serialize against the transport. */
     pthread_mutex_lock(&ctx->xportLock);

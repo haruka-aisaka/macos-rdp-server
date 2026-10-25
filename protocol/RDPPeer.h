@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 #include <freerdp/freerdp.h>
@@ -101,6 +102,12 @@ struct rdp_peer_context {
     bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
+    /* Saving data (macrdpx AUDIO_AAC): the client's index of the private AAC
+     * format at the negotiated rate, -1 when it listed none; whether the
+     * client asked for it; and the encoder, made on the audio send queue. */
+    int                  aacFormatIndex;
+    _Atomic bool         audioCompressed;
+    struct RDPAACEncoder *aacEncoder;
     /* Clipboard: the host's current data, advertised via Format List and held
      * until the client sends a Format Data Request (MS-RDPECLIP flow). Owned
      * copy — the source pasteboard pointer is only valid during the send call. */
@@ -232,6 +239,10 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
  * the captured/sent rate equals the client's playback rate (otherwise the audio
  * is pitch-shifted). Safe to call from any thread. */
 uint32_t rdp_peer_get_audio_rate(freerdp_peer *peer);
+
+/* The client asked for its audio as AAC, or as it is (macrdpx STREAM_CONFIG
+ * audio_compressed). Takes effect with the next wave. */
+void rdp_peer_set_audio_compressed(freerdp_peer *peer, bool compressed);
 
 bool rdp_peer_send_clipboard(freerdp_peer *peer,
                               const uint8_t *data, size_t len,

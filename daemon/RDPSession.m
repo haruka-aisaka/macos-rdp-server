@@ -26,7 +26,7 @@ static const uint32_t kDefaultMaxFps  = 30;
 /* What this server offers a MACRDPX client (external/macrdpx). */
 static const mrx_caps kServerMrxCaps = MRX_CAP_MAC_KEYS | MRX_CAP_POINTER |
     MRX_CAP_PRECISE_SCROLL | MRX_CAP_STREAM_CONFIG | MRX_CAP_INPUT_SOURCE |
-    MRX_CAP_CURSOR_ALPHA | MRX_CAP_GESTURES;
+    MRX_CAP_CURSOR_ALPHA | MRX_CAP_GESTURES | MRX_CAP_AUDIO_AAC;
 
 static uint32_t env_u32(const char *name, uint32_t dflt) {
     const char *v = getenv(name);
@@ -354,6 +354,8 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     case MRX_MSG_STREAM_CONFIG:
         if (!(_mrxCaps & MRX_CAP_STREAM_CONFIG)) return;
         [self applyStreamFps:m->u.stream_config.max_fps kbps:m->u.stream_config.bitrate_kbps];
+        rdp_peer_set_audio_compressed(_peer, (_mrxCaps & MRX_CAP_AUDIO_AAC) &&
+                                             m->u.stream_config.audio_compressed);
         return;
     default:
         break;
