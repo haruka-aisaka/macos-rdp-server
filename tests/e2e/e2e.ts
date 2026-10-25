@@ -16,6 +16,7 @@
  *   resize       表示制御チャネルでの大きさ・拡大率の変更に、画面とストリームが追従する
  *   audio        Mac で鳴らした正弦波が、崩れずに（周波数・SN 比・途切れ）届く
  *   audio-silence 音が止まったら音声を送らず、次に鳴った音は欠けずに届く
+ *   audio-aac    省データの AAC で、音声が 1/10 以下の量で崩れずに届く
  *   reconnect    きれいな切断・強制切断のあと、同じ仮想ディスプレイを使い回して何度でもつなげる
  *   takeover     前の接続が残ったまま新しい接続が来ると、新しい方に切り替わる
  *   rescale      つなぎ直したときに頼んだ拡大率（Retina / 等倍）が反映される
@@ -139,9 +140,10 @@ class Client {
   private waiters: { pred: (e: Event) => boolean; resolve: (e: Event) => void }[] = [];
   readonly done: Promise<void>;
 
-  constructor(opts: { width: number; height: number; scale: number; audio?: string; gfx?: string }) {
+  constructor(opts: { width: number; height: number; scale: number; audio?: string; gfx?: string; aac?: boolean }) {
     const argv = [];
     if (opts.audio) argv.push("--audio", opts.audio);
+    if (opts.aac) argv.push("--aac");
     argv.push(
       "--",
       "/v:127.0.0.1",
@@ -238,8 +240,10 @@ class Client {
   }
 }
 
-async function connect(width: number, height: number, scale: number, audio?: string, gfx?: string): Promise<Client> {
-  const client = new Client({ width, height, scale, audio, gfx });
+async function connect(
+  width: number, height: number, scale: number, audio?: string, gfx?: string, aac?: boolean,
+): Promise<Client> {
+  const client = new Client({ width, height, scale, audio, gfx, aac });
   const first = await Promise.race([
     client.wait((e) => e.ev === "connected" || e.ev === "connect-failed", "接続", 20000),
     client.status.then((s) => ({ ev: "exited", code: s.code } as Event)),
@@ -258,14 +262,14 @@ async function buildTools() {
   await run("cc", [
     "-O1", "-g", "-Wall", "-Wno-deprecated-declarations", "-o", CLIENT, `${HERE}rdp-e2e-client.c`,
     `-I${prefix}/include/freerdp3`, `-I${prefix}/include/winpr3`, `-L${prefix}/lib`,
-    "-lfreerdp-client3", "-lfreerdp3", "-lwinpr3",
+    "-lfreerdp-client3", "-lfreerdp3", "-lwinpr3", "-framework", "AudioToolbox",
   ]);
   await run("swiftc", ["-O", "-o", PROBE, `${HERE}display-probe.swift`]);
   // クライアント（mRemote）の E2E で Mac の画面に出す目印の窓
   await run("swiftc", ["-O", "-o", `${WORK}/e2e-target`, `${HERE}e2e-target.swift`]);
 }
 
-function plist(): string {
+function plist(extraEnv: Record<string, string> = {}): string {
   const env: Record<string, string> = {
     RDP_LISTEN_ADDRESS: "127.0.0.1",
     RDP_ALLOW_NO_AUTH: "1", // 127.0.0.1 でしか待ち受けないので、テストの間だけ
@@ -283,6 +287,7 @@ function plist(): string {
     const [k, ...v] = args[i + 1].split("=");
     env[k] = v.join("=");
   });
+  Object.assign(env, extraEnv);
   const envXml = Object.entries(env).map(([k, v]) => `\t\t<key>${k}</key>\n\t\t<string>${v}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -319,10 +324,10 @@ ${envXml}
 `;
 }
 
-async function startServer() {
+async function startServer(extraEnv: Record<string, string> = {}) {
   await stopServer();
   await Deno.writeTextFile(SERVER_LOG, "");
-  await Deno.writeTextFile(PLIST, plist());
+  await Deno.writeTextFile(PLIST, plist(extraEnv));
   await run("launchctl", ["bootstrap", `gui/${await uid()}`, PLIST]);
   await waitFor("テスト用サーバの待ち受け", listenerPid);
 }
@@ -625,6 +630,38 @@ async function main() {
     expect(Math.abs(report.frequency - TONE_HZ) < TONE_HZ * 0.005 && report.snrDb > 35 && report.dropouts === 0,
       "2 回目の音が崩れている", report);
     return `無音 5 秒で ${silentBytes} バイト・2 回目 ${report.seconds.toFixed(1)} 秒・SN 比 ${report.snrDb.toFixed(1)}dB`;
+  });
+
+  await settle();
+  await test("audio-aac", "省データの AAC: 音声が 1/10 以下の量で、崩れずに届く", async () => {
+    // mRemote は Mac 拡張で頼むが、テスト用クライアントは Mac 拡張を持たないので、サーバ側で最初から AAC にする
+    await startServer({ RDP_AUDIO_AAC: "1" });
+    const wav = `${WORK}/tone.wav`, raw = `${WORK}/audio-aac.raw`;
+    await writeToneWav(wav);
+    let format: Event, bytes = 0;
+    const c = await connect(1920, 1200, 200, raw, undefined, true);
+    try {
+      await sleep(1000);
+      await run("afplay", [wav]);
+      await sleep(1500);
+      format = await c.wait((e) => e.ev === "audio-format" && e.tag === 0x4D52, "AAC の形式", 5000);
+      bytes = (await c.stats()).audioBytes as number;
+    } finally {
+      await c.quit();
+      await startServer();
+      displayId = 0; // 起動し直したので、仮想ディスプレイは新しく作られる
+    }
+    // 4 秒の音（と余韻）で、非圧縮なら 44.1kHz で約 800KB
+    const kbps = (bytes * 8) / 1000 / (TONE_SECONDS + 0.5);
+    log(`届いた AAC: ${bytes} バイト（約 ${kbps.toFixed(0)}kbps）`);
+    expect(kbps < 150, "AAC なのに量が多い", { bytes, kbps });
+    const report = analyzeTone(await Deno.readFile(raw), format.rate as number, format.channels as number);
+    log(`展開した音: ${JSON.stringify(report)}`);
+    expect(report.seconds > TONE_SECONDS - 0.5, "鳴っている区間が短い", report);
+    expect(Math.abs(report.frequency - TONE_HZ) < TONE_HZ * 0.005, "周波数がずれている", report);
+    expect(report.snrDb > 30, "SN 比が低い（音が崩れている）", report);
+    expect(report.dropouts === 0, "途中で音が抜けている", report);
+    return `${format.rate}Hz・約 ${kbps.toFixed(0)}kbps・SN 比 ${report.snrDb.toFixed(1)}dB・${report.seconds.toFixed(1)}秒`;
   });
 
   await settle();

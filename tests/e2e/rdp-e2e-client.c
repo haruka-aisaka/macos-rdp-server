@@ -1,7 +1,10 @@
 /*
  * rdp-e2e-client: E2E テスト用の、画面を持たない RDP クライアント。
  *
- *   rdp-e2e-client [--audio <file.raw>] -- <FreeRDP の引数 (/v: /port: /u: /p: /size: /cert:ignore ...)>
+ *   rdp-e2e-client [--audio <file.raw>] [--aac] -- <FreeRDP の引数 (/v: /port: /u: /p: /size: /cert:ignore ...)>
+ *
+ * --aac: mRemote と同じく、Mac 拡張の AAC（形式 0x4D52、ADTS）も受け取れると申告し、届いたら展開して書く。
+ * stats の audioBytes は届いたままのバイト数（AAC なら圧縮されたまま）。
  *
  * Homebrew の FreeRDP 3（クライアント側）で動かす。届いた画面は gdi の枠に描かせ、
  * 届いた音は加工せずに --audio のファイルへ書く（16bit PCM だけを受けると申告する）。
@@ -40,6 +43,7 @@
 #include <freerdp/input.h>
 #include <freerdp/scancode.h>
 #include <winpr/synch.h>
+#include <AudioToolbox/AudioToolbox.h>
 
 typedef struct
 {
@@ -49,6 +53,14 @@ typedef struct
 } e2eContext;
 
 static FILE* g_audio;
+static BOOL g_acceptAac;
+#define WAVE_FORMAT_MRX_AAC 0x4D52
+/* AAC を受けている間の展開器 */
+static AudioConverterRef g_aac;
+static UInt32 g_aacChannels;
+static const BYTE* g_aacPacket;
+static UInt32 g_aacPacketSize;
+static AudioStreamPacketDescription g_aacDescription;
 static unsigned long long g_audioBytes;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char* g_queue[64];
@@ -75,13 +87,101 @@ typedef struct
 static BOOL snd_format_supported(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format)
 {
 	(void)device;
+	if (g_acceptAac && format->wFormatTag == WAVE_FORMAT_MRX_AAC)
+		return TRUE;
 	return format->wFormatTag == WAVE_FORMAT_PCM && format->wBitsPerSample == 16;
+}
+
+static void aac_close(void)
+{
+	if (g_aac)
+		AudioConverterDispose(g_aac);
+	g_aac = NULL;
+}
+
+static BOOL aac_open(const AUDIO_FORMAT* format)
+{
+	aac_close();
+	AudioStreamBasicDescription in = { .mSampleRate = format->nSamplesPerSec,
+		                               .mFormatID = kAudioFormatMPEG4AAC,
+		                               .mFormatFlags = kMPEG4Object_AAC_LC,
+		                               .mFramesPerPacket = 1024,
+		                               .mChannelsPerFrame = format->nChannels };
+	AudioStreamBasicDescription out = { .mSampleRate = format->nSamplesPerSec,
+		                                .mFormatID = kAudioFormatLinearPCM,
+		                                .mFormatFlags = kAudioFormatFlagIsSignedInteger |
+		                                                kAudioFormatFlagIsPacked,
+		                                .mBytesPerPacket = 2 * format->nChannels,
+		                                .mFramesPerPacket = 1,
+		                                .mBytesPerFrame = 2 * format->nChannels,
+		                                .mChannelsPerFrame = format->nChannels,
+		                                .mBitsPerChannel = 16 };
+	g_aacChannels = format->nChannels;
+	return AudioConverterNew(&in, &out, &g_aac) == noErr;
+}
+
+static OSStatus aac_input(AudioConverterRef converter, UInt32* ioPackets, AudioBufferList* data,
+                          AudioStreamPacketDescription** descriptions, void* user)
+{
+	(void)converter;
+	(void)user;
+	if (!g_aacPacket)
+	{
+		*ioPackets = 0;
+		return 'mrxE';
+	}
+	data->mNumberBuffers = 1;
+	data->mBuffers[0].mNumberChannels = g_aacChannels;
+	data->mBuffers[0].mData = (void*)g_aacPacket;
+	data->mBuffers[0].mDataByteSize = g_aacPacketSize;
+	g_aacDescription.mStartOffset = 0;
+	g_aacDescription.mVariableFramesInPacket = 0;
+	g_aacDescription.mDataByteSize = g_aacPacketSize;
+	if (descriptions)
+		*descriptions = &g_aacDescription;
+	*ioPackets = 1;
+	g_aacPacket = NULL;
+	return noErr;
+}
+
+/* ADTS の枠ごとに展開して、PCM を書く */
+static void aac_play(const BYTE* data, size_t size)
+{
+	size_t at = 0;
+	while (g_aac && at + 7 <= size && data[at] == 0xFF && (data[at + 1] & 0xF0) == 0xF0)
+	{
+		size_t header = (data[at + 1] & 1) ? 7 : 9;
+		size_t length = ((size_t)(data[at + 3] & 3) << 11) | ((size_t)data[at + 4] << 3) |
+		                (data[at + 5] >> 5);
+		if (length < header || at + length > size)
+			break;
+		g_aacPacket = data + at + header;
+		g_aacPacketSize = (UInt32)(length - header);
+		int16_t pcm[2048 * 2];
+		UInt32 frames = 2048;
+		AudioBufferList list = { .mNumberBuffers = 1 };
+		list.mBuffers[0].mNumberChannels = g_aacChannels;
+		list.mBuffers[0].mData = pcm;
+		list.mBuffers[0].mDataByteSize = sizeof pcm;
+		AudioConverterFillComplexBuffer(g_aac, aac_input, NULL, &frames, &list, NULL);
+		if (frames && g_audio)
+			fwrite(pcm, 1, (size_t)frames * 2 * g_aacChannels, g_audio);
+		g_aacPacket = NULL;
+		at += length;
+	}
 }
 
 static BOOL snd_open(rdpsndDevicePlugin* device, const AUDIO_FORMAT* format, UINT32 latency)
 {
 	(void)device;
 	(void)latency;
+	if (format->wFormatTag == WAVE_FORMAT_MRX_AAC)
+	{
+		if (!aac_open(format))
+			return FALSE;
+	}
+	else
+		aac_close();
 	emit("{\"ev\":\"audio-format\",\"tag\":%u,\"rate\":%u,\"channels\":%u,\"bits\":%u}",
 	     format->wFormatTag, format->nSamplesPerSec, format->nChannels, format->wBitsPerSample);
 	return TRUE;
@@ -103,7 +203,9 @@ static UINT32 snd_get_volume(rdpsndDevicePlugin* device)
 static UINT snd_play(rdpsndDevicePlugin* device, const BYTE* data, size_t size)
 {
 	(void)device;
-	if (g_audio)
+	if (g_aac)
+		aac_play(data, size);
+	else if (g_audio)
 		fwrite(data, 1, size, g_audio);
 	g_audioBytes += size;
 	return 0; /* 遅延（ミリ秒） */
@@ -362,6 +464,8 @@ int main(int argc, char* argv[])
 	{
 		if (strcmp(argv[sep], "--audio") == 0 && sep + 1 < argc)
 			audioPath = argv[++sep];
+		else if (strcmp(argv[sep], "--aac") == 0)
+			g_acceptAac = TRUE;
 	}
 	if (sep >= argc)
 	{
