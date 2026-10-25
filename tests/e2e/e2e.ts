@@ -3,6 +3,8 @@
  * macos-rdp-server の E2E テスト（この Mac の中だけで完結する）。
  *
  *   deno run -A tests/e2e/e2e.ts [--only 名前,名前] [--keep-server]
+ *   deno run -A tests/e2e/e2e.ts --serve [--keep 秒] [--log debug]   テスト用サーバを起動して残す（クライアントの E2E 用）
+ *   deno run -A tests/e2e/e2e.ts --stop                テスト用サーバを止める
  *
  * いま入っているサーバ（~/.macos-rdp/bin/macos-rdp-daemon）を、本番の LaunchAgent とは別のラベル
  * （com.macosrdp.e2e）で 127.0.0.1:3390 に起動し、テスト用クライアント（rdp-e2e-client、Homebrew の
@@ -28,7 +30,8 @@ const BIN = `${HOME}/.macos-rdp/bin/macos-rdp-daemon`;
 const LABEL = "com.macosrdp.e2e";
 const PLIST = `${HOME}/Library/LaunchAgents/${LABEL}.plist`;
 const PORT = 3390;
-const KEEP = 15; // 無接続でこの秒数たつと仮想ディスプレイを解放する（本番は 300）
+// 無接続でこの秒数たつと仮想ディスプレイを解放する（本番は 300）
+const KEEP = Deno.args.includes("--keep") ? Number(Deno.args[Deno.args.indexOf("--keep") + 1]) : 15;
 const SERVER_LOG = `${WORK}/server.log`;
 const CLIENT = `${WORK}/rdp-e2e-client`;
 const PROBE = `${WORK}/display-probe`;
@@ -256,6 +259,8 @@ async function buildTools() {
     "-lfreerdp-client3", "-lfreerdp3", "-lwinpr3",
   ]);
   await run("swiftc", ["-O", "-o", PROBE, `${HERE}display-probe.swift`]);
+  // クライアント（mRemote）の E2E で Mac の画面に出す目印の窓
+  await run("swiftc", ["-O", "-o", `${WORK}/e2e-target`, `${HERE}e2e-target.swift`]);
 }
 
 function plist(): string {
@@ -265,7 +270,7 @@ function plist(): string {
     RDP_DISPLAY_MODE: "virtual",
     RDP_KEYBOARD_TYPE: "ansi",
     RDP_CERT_DIR: `${HOME}/.macos-rdp`,
-    RDP_LOG_LEVEL: "verbose",
+    RDP_LOG_LEVEL: args.includes("--log") ? args[args.indexOf("--log") + 1] : "verbose",
     RDP_UPDATE_ENABLED: "0",
     RDP_VIRTUAL_DISPLAY_KEEP: String(KEEP),
     RDP_AUDIO_LOCAL: "0", // テストの正弦波をスピーカーから鳴らさない
@@ -692,6 +697,21 @@ async function main() {
   await Deno.writeTextFile(`${WORK}/results.json`, JSON.stringify(results, null, 2));
   console.log(`サーバのログ: ${SERVER_LOG}`);
   Deno.exit(results.every((r) => r.ok) ? 0 : 1);
+}
+
+if (args.includes("--stop")) {
+  await stopServer();
+  Deno.exit(0);
+}
+if (args.includes("--serve")) {
+  if (await productionInUse() && !args.includes("--force")) {
+    console.error("本番のサーバ（3389）に接続中のクライアントがあります（--force で無視）");
+    Deno.exit(2);
+  }
+  await buildTools();
+  await startServer();
+  console.log(`テスト用サーバ: 127.0.0.1:${PORT}（${LABEL}、KEEP ${KEEP}s）ログ ${SERVER_LOG}`);
+  Deno.exit(0);
 }
 
 try {
