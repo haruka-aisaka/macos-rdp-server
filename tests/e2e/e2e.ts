@@ -22,6 +22,7 @@
  *   rescale      つなぎ直したときに頼んだ拡大率（Retina / 等倍）が反映される
  *   bitmap-resize H.264 を使わないクライアントで、送信中に大きさを続けて変えても落ちない
  *   idle         放置すると仮想ディスプレイを解放してプロセスが終わり、launchd が起動し直す。その後もつながる
+ *   wake         画面が寝たまま仮想ディスプレイが解放されたあとに接続しても、すぐ画面が届く
  *
  * 前提: brew install freerdp（クライアントとして使うだけ）。Deno。
  */
@@ -74,6 +75,8 @@ interface Display {
 }
 interface Probe {
   displays: Display[];
+  /** 寝ている画面も含めた一覧 */
+  online: { id: number; asleep: boolean; vendor: number }[];
   mouse: { x: number; y: number };
 }
 
@@ -686,6 +689,38 @@ async function main() {
       const d = await expectVirtualDisplay(2560, 1600, true);
       await expectPointer(c, d, 1280, 800);
       return `pid ${pid} → ${restarted}・新しいディスプレイ ${d.id}`;
+    } finally {
+      await c.quit();
+    }
+  });
+
+  await settle();
+  await test("wake", "画面が寝たまま仮想ディスプレイが解放されたあとに接続しても、すぐ画面が届く", async () => {
+    // 本番で起きた順にする: 仮想ディスプレイがあるまま画面が寝て、寝たまま解放される（macOS の一覧に
+    // 寝た画面が残る）。次の接続は仮想ディスプレイを新しく作り、それをメインにしようとして止まっていた
+    // （物理モニターがなく、macOS の代わりの画面しかないときは、画面が寝ないので起きない）
+    await stopServer();
+    await waitFor("仮想ディスプレイの消滅", async () => (await virtualDisplays()).length === 0, 15000);
+    await startServer();
+    await (await connect(2560, 1600, 200)).quit();
+    await run("pmset", ["displaysleepnow"]);
+    const slept = await waitFor("画面が寝る", async () => {
+      const p = await probe();
+      return p.online.length > 0 && p.online.every((d) => d.asleep) && p;
+    }, 20000).catch(async () => {
+      throw new Failure(`画面が寝ない: ${JSON.stringify((await probe()).online)}`);
+    });
+    await stopServer();
+    await startServer();
+    log(`寝ている画面: ${slept.online.map((d) => d.id).join(", ")}`);
+    const t0 = Date.now();
+    const c = await connect(2560, 1600, 200);
+    const sec = (Date.now() - t0) / 1000;
+    try {
+      // 直す前は、寝た画面のまま仮想ディスプレイをメインにしようとして約 50 秒止まっていた
+      expect(sec < 10, `画面が届くまで ${sec.toFixed(1)} 秒かかった`);
+      const d = await expectVirtualDisplay(2560, 1600, true);
+      return `画面が届くまで ${sec.toFixed(1)} 秒・ディスプレイ ${d.id}`;
     } finally {
       await c.quit();
     }

@@ -1,6 +1,6 @@
 // display-probe: いまの画面の構成とポインタの位置を JSON で出す（E2E テストが Mac 側を確かめるため）。
 //
-//   display-probe            画面の一覧とポインタ
+//   display-probe            画面の一覧（online は寝ている画面も含む）とポインタ
 //   display-probe warp X Y   ポインタを (X, Y)（全体の座標、ポイント）へ動かしてから出す
 import CoreGraphics
 import Foundation
@@ -32,7 +32,14 @@ for id in ids.prefix(Int(count)) {
     }
     displays.append(entry)
 }
+// 寝ている画面は active の一覧に出ないので、online の一覧で寝ているかを見る
+var onlineIds = [CGDirectDisplayID](repeating: 0, count: 16)
+var onlineCount: UInt32 = 0
+CGGetOnlineDisplayList(16, &onlineIds, &onlineCount)
+let online: [[String: Any]] = onlineIds.prefix(Int(onlineCount)).map {
+    ["id": $0, "asleep": CGDisplayIsAsleep($0) != 0, "vendor": CGDisplayVendorNumber($0)]
+}
 let mouse = CGEvent(source: nil)?.location ?? .zero
-let output: [String: Any] = ["displays": displays, "mouse": ["x": mouse.x, "y": mouse.y]]
+let output: [String: Any] = ["displays": displays, "online": online, "mouse": ["x": mouse.x, "y": mouse.y]]
 let data = try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
 print(String(decoding: data, as: UTF8.self))
