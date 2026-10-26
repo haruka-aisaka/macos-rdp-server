@@ -38,6 +38,14 @@ NS_ASSUME_NONNULL_BEGIN
  */
 @interface DisplayControl : NSObject
 
+/* Wake sleeping displays before a session sets up its display, and wait
+ * (up to a few seconds) until they are awake. A virtual display released while
+ * the displays slept stays registered (asleep, still the main display), and
+ * making the next session's new virtual display the main one stalled for
+ * ~50 s (five 10 s timeouts, rc=1014): the client saw a black screen until
+ * -start woke the display afterwards. Once awake, the stale one goes away. */
++ (void)wakeDisplaysForIncomingSession;
+
 /* virtualDisplayID is the display the remote session captures and MUST NOT be
  * dimmed. Every other active display that is built-in is dimmed for privacy. */
 - (instancetype)initWithVirtualDisplayID:(CGDirectDisplayID)virtualDisplayID;

@@ -96,6 +96,35 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
 
 @implementation DisplayControl
 
+static uint32_t asleepOnlineDisplays(void) {
+    CGDirectDisplayID ids[16];
+    uint32_t count = 0, asleep = 0;
+    if (CGGetOnlineDisplayList(16, ids, &count) != kCGErrorSuccess) return 0;
+    for (uint32_t i = 0; i < count; i++)
+        if (CGDisplayIsAsleep(ids[i])) asleep++;
+    return asleep;
+}
+
++ (void)wakeDisplaysForIncomingSession {
+    uint32_t asleep = asleepOnlineDisplays();
+    IOPMAssertionID activityID = kIOPMNullAssertionID;
+    IOReturn ar = IOPMAssertionDeclareUserActivity(CFSTR("rdp-connect"),
+                                                   kIOPMUserActiveLocal,
+                                                   &activityID);
+    if (ar != kIOReturnSuccess) {
+        rdp_error("IOPMAssertionDeclareUserActivity failed (0x%x)", ar);
+        return;
+    }
+    if (!asleep) return;
+    /* Waking takes a moment; the display configuration must wait for it. */
+    for (int i = 0; i < 50 && (asleep = asleepOnlineDisplays()); i++)
+        usleep(100000);
+    if (asleep)
+        rdp_error("%u display(s) still asleep 5 s after declaring user activity", asleep);
+    else
+        rdp_info("woke the sleeping display(s) before setting up the session display");
+}
+
 - (instancetype)initWithVirtualDisplayID:(CGDirectDisplayID)virtualDisplayID {
     if ((self = [super init])) {
         _virtualDisplayID      = virtualDisplayID;

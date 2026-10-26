@@ -615,6 +615,7 @@ static void rdp_on_keyframe_request(void *ud) {
     uint32_t height = h ?: kDefaultHeight;
 
     rdp_info("setting up display %ux%u for %s", width, height, _address.UTF8String);
+    [DisplayControl wakeDisplaysForIncomingSession];
 
     /* Retina: a client drawing at 150% or more (a Mac's 200%) gets a HiDPI
      * virtual display, so text is rendered at its pixel density instead of
