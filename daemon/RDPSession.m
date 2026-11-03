@@ -26,7 +26,26 @@ static const uint32_t kDefaultMaxFps  = 30;
 /* What this server offers a MACRDPX client (external/macrdpx). */
 static const mrx_caps kServerMrxCaps = MRX_CAP_MAC_KEYS | MRX_CAP_POINTER |
     MRX_CAP_PRECISE_SCROLL | MRX_CAP_STREAM_CONFIG | MRX_CAP_INPUT_SOURCE |
-    MRX_CAP_CURSOR_ALPHA | MRX_CAP_GESTURES | MRX_CAP_AUDIO_AAC;
+    MRX_CAP_CURSOR_ALPHA | MRX_CAP_GESTURES | MRX_CAP_AUDIO_AAC | MRX_CAP_ALIVE;
+
+/* A client that agreed to ALIVE and has sent nothing on MACRDPX for this long
+ * is taken to be gone - an iPhone app suspended in the background, killed, or
+ * out of coverage - and its session is ended. RDP_CLIENT_ALIVE_TIMEOUT
+ * (seconds) changes it; 0 never ends a session for this. */
+static const uint32_t kDefaultClientAliveTimeoutSecs = 20 * 60;
+
+static uint32_t client_alive_timeout_secs(void) {
+    const char *v = getenv("RDP_CLIENT_ALIVE_TIMEOUT");
+    if (!v || !*v) return kDefaultClientAliveTimeoutSecs;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v || n < 0) return kDefaultClientAliveTimeoutSecs;
+    return (uint32_t)n;
+}
+
+static uint64_t monotonic_secs(void) {
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC) / NSEC_PER_SEC;
+}
 
 static uint32_t env_u32(const char *name, uint32_t dflt) {
     const char *v = getenv(name);
@@ -119,6 +138,10 @@ static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
 @property (nonatomic, assign) uint32_t streamWidth;
 @property (nonatomic, assign) uint32_t streamHeight;
 @property (nonatomic, strong) RDPAudioSink *mrxSink;
+/* When anything last arrived on MACRDPX (monotonic seconds), and how long a
+ * client that agreed to ALIVE may stay quiet. Session queue only. */
+@property (nonatomic, assign) uint64_t mrxLastHeard;
+@property (nonatomic, assign) uint32_t clientAliveTimeout;
 /* Bumped whenever the encoder/capture pair is replaced (resize), so frames
  * still in flight from the old pair are dropped instead of sent. */
 @property (atomic, assign) uint64_t mediaGeneration;
@@ -164,6 +187,7 @@ static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
         .userdata    = (__bridge void *)self,
     };
 
+    _clientAliveTimeout = client_alive_timeout_secs();
     _maxFps      = clamp_u32(env_u32("RDP_MAX_FPS", kDefaultMaxFps), 1, 120);
     _bitrateKbps = clamp_u32(env_u32("RDP_BITRATE_KBPS", kDefaultBitrate), 250, 200000);
 
@@ -197,6 +221,12 @@ static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
             [[NSDate date] compare:negoDeadline] == NSOrderedDescending) {
             rdp_info("negotiation timeout (%gs) for %s — dropping stale connection",
                      kNegotiationTimeoutSecs, _address.UTF8String);
+            break;
+        }
+        if ([self clientWentQuiet]) {
+            rdp_info("nothing from %s for %u s although it agreed to send ALIVE — "
+                     "the client has gone quiet; disconnecting",
+                     _address.UTF8String, (unsigned)_clientAliveTimeout);
             break;
         }
         /* Display-control requests, applied here on the session queue where
@@ -325,7 +355,15 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     }
 }
 
+/* Only for a client that agreed to ALIVE: any other sends nothing while its
+ * screen is still, and must not be dropped for that. */
+- (BOOL)clientWentQuiet {
+    if (!_clientAliveTimeout || !(_mrxCaps & MRX_CAP_ALIVE) || !_mrxLastHeard) return NO;
+    return monotonic_secs() - _mrxLastHeard >= _clientAliveTimeout;
+}
+
 - (void)handleMrxMessage:(const mrx_message *)m {
+    _mrxLastHeard = monotonic_secs();
     switch (m->type) {
     case MRX_MSG_HELLO: {
         if (m->u.hello.role != MRX_ROLE_CLIENT) return;
@@ -333,6 +371,9 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
         rdp_info("MACRDPX client \"%.*s\" v%u caps=0x%x -> using 0x%x",
                  (int)m->u.hello.name_length, m->u.hello.name ?: "", m->u.hello.version,
                  m->u.hello.caps, _mrxCaps);
+        if ((_mrxCaps & MRX_CAP_ALIVE) && _clientAliveTimeout)
+            rdp_info("the client sends ALIVE: ended after %u s without word from it",
+                     (unsigned)_clientAliveTimeout);
         char name[128];
         NSOperatingSystemVersion v = NSProcessInfo.processInfo.operatingSystemVersion;
         snprintf(name, sizeof name, "macos-rdp-server %s; macOS %ld.%ld.%ld", MACOS_RDP_VERSION,
@@ -351,6 +392,8 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
         _mrxKeyboardType = m->u.keyboard_info.keyboard_type;
         if (_injector) [_injector setMacKeyboardType:_mrxKeyboardType];
         return;
+    case MRX_MSG_ALIVE:
+        return;   /* heard: noted above */
     case MRX_MSG_STREAM_CONFIG:
         if (!(_mrxCaps & MRX_CAP_STREAM_CONFIG)) return;
         [self applyStreamFps:m->u.stream_config.max_fps kbps:m->u.stream_config.bitrate_kbps];

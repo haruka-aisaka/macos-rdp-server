@@ -165,6 +165,7 @@ Settings are environment variables passed to `macos-rdp-install-user` (see
 | `RDP_GFX_CODEC` | `auto` | Graphics codec. `auto`: H.264 (AVC420) when the client accepts it, RemoteFX Progressive when it does not (Windows App on iPhone); `avc`, `progressive` or `planar` force one, for testing |
 | `RDP_DISPLAY_MODE` | `main` | `main` shows the Mac's main display; `virtual` gives the session a display of its own, sized to the client (a reconnect takes over the same one) |
 | `RDP_VIRTUAL_DISPLAY_KEEP` | `300` | With `virtual`: seconds the display is kept for a reconnect after a session ends; then it is released and the agent restarts |
+| `RDP_CLIENT_ALIVE_TIMEOUT` | `1200` | Seconds a client that agreed to MACRDPX `ALIVE` (mRemote) may send nothing before its session is ended — an iPhone app suspended in the background, killed, or out of coverage. `0` never ends a session for this. Other clients are never ended for being quiet |
 | `RDP_MATCH_RESOLUTION` | `1` | On the main display: `1` switches the Mac's resolution to the mode closest to the client's; `0` leaves it as it is |
 | `RDP_HIDPI` | auto | `auto`: HiDPI virtual display at a client scale ≥ 150 %; `0` never; `1` always |
 | `RDP_DISP` | on | `0` disables display control (the desktop keeps its connect-time size) |
