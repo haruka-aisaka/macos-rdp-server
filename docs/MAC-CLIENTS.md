@@ -25,6 +25,7 @@ mRemote client.
 | Input source | — | The server reports its keyboard input source (ASCII or a Japanese/Chinese/Korean input mode) |
 | Cursor | System arrow (shapes off by default) | Real cursor shapes, 32-bit with alpha, at the display's pixel scale |
 | Gestures | — | Pinch, rotate and smart zoom reach the app under the pointer as a trackpad's own gestures; three- and four-finger swipes can drive the Dock's swipes (Spaces, Mission Control) following the fingers |
+| A client gone quiet | The session stays until TCP gives up, which can be hours | A client that agreed to ALIVE sends it every 30 s; after `RDP_CLIENT_ALIVE_TIMEOUT` seconds (default 1200, `0` off) without a word from it - an iPhone app suspended in the background, killed, or out of coverage - the session ends as if the connection had dropped |
 
 Display control (MS-RDPEDISP) and HiDPI are **not** extensions. On the main
 display (the default), every client that resizes its window gets the stream
