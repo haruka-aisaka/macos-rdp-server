@@ -12,6 +12,7 @@
 #import "audio/AudioCapture.h"
 #import "audio/AudioRedirect.h"
 #import <os/lock.h>
+#import <sys/socket.h>
 #import <stdatomic.h>
 #import <unistd.h>
 #include <freerdp/freerdp.h>
@@ -138,10 +139,17 @@ static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
 @property (nonatomic, assign) uint32_t streamWidth;
 @property (nonatomic, assign) uint32_t streamHeight;
 @property (nonatomic, strong) RDPAudioSink *mrxSink;
-/* When anything last arrived on MACRDPX (monotonic seconds), and how long a
- * client that agreed to ALIVE may stay quiet. Session queue only. */
-@property (nonatomic, assign) uint64_t mrxLastHeard;
+/* When anything last arrived on MACRDPX (monotonic seconds; written on the
+ * session queue, read by the watchdog), and how long a client that agreed to
+ * ALIVE may stay quiet. */
+@property (atomic, assign) uint64_t mrxLastHeard;
 @property (nonatomic, assign) uint32_t clientAliveTimeout;
+/* Checks for a quiet client off the session queue: that queue can be stuck
+ * writing to a client that no longer reads, which is just the case to catch. */
+@property (nonatomic, strong) dispatch_source_t aliveWatchdog;
+/* Taken around closing the socket and around the watchdog's shutdown(), so
+ * the watchdog never shuts down a descriptor number already reused. */
+@property (nonatomic, assign) os_unfair_lock fdLock;
 /* Bumped whenever the encoder/capture pair is replaced (resize), so frames
  * still in flight from the old pair are dropped instead of sent. */
 @property (atomic, assign) uint64_t mediaGeneration;
@@ -157,6 +165,7 @@ static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
         _sessionQueue   = dispatch_queue_create("com.macosrdp.session",
                                                 DISPATCH_QUEUE_SERIAL);
         _teardownSem    = dispatch_semaphore_create(0);
+        _fdLock         = OS_UNFAIR_LOCK_INIT;
         _audioQueue     = dispatch_queue_create("com.macosrdp.session.audio",
                                                 DISPATCH_QUEUE_SERIAL);
     }
@@ -221,12 +230,6 @@ static BOOL audio_is_silent(const int16_t *samples, uint32_t frameCount) {
             [[NSDate date] compare:negoDeadline] == NSOrderedDescending) {
             rdp_info("negotiation timeout (%gs) for %s — dropping stale connection",
                      kNegotiationTimeoutSecs, _address.UTF8String);
-            break;
-        }
-        if ([self clientWentQuiet]) {
-            rdp_info("nothing from %s for %u s although it agreed to send ALIVE — "
-                     "the client has gone quiet; disconnecting",
-                     _address.UTF8String, (unsigned)_clientAliveTimeout);
             break;
         }
         /* Display-control requests, applied here on the session queue where
@@ -358,8 +361,41 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
 /* Only for a client that agreed to ALIVE: any other sends nothing while its
  * screen is still, and must not be dropped for that. */
 - (BOOL)clientWentQuiet {
-    if (!_clientAliveTimeout || !(_mrxCaps & MRX_CAP_ALIVE) || !_mrxLastHeard) return NO;
-    return monotonic_secs() - _mrxLastHeard >= _clientAliveTimeout;
+    uint64_t heard = self.mrxLastHeard;
+    if (!_clientAliveTimeout || !(_mrxCaps & MRX_CAP_ALIVE) || !heard) return NO;
+    return monotonic_secs() - heard >= _clientAliveTimeout;
+}
+
+- (void)startAliveWatchdog {
+    if (_aliveWatchdog) return;
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                              5 * NSEC_PER_SEC, NSEC_PER_SEC);
+    __weak RDPSession *weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{ [weakSelf aliveWatchdogFired]; });
+    _aliveWatchdog = timer;
+    dispatch_resume(timer);
+}
+
+/* Ends the session from outside its queue. The session loop may be blocked in
+ * a write to the client that no longer reads (its socket buffer full), holding
+ * the transport lock, so it would never see a flag; shutting the socket down
+ * makes that write fail, and the loop ends and tears down as when the
+ * connection drops. */
+- (void)aliveWatchdogFired {
+    if (![self clientWentQuiet]) return;
+    /* teardown cancels the timer; until then a dropped session is a no-op here. */
+    os_unfair_lock_lock(&_fdLock);
+    if (_fd >= 0 && _sessionState != RDPSessionStateDisconnecting &&
+        _sessionState != RDPSessionStateDisconnected) {
+        rdp_info("nothing from %s for %u s although it agreed to send ALIVE — "
+                 "the client has gone quiet; disconnecting",
+                 _address.UTF8String, (unsigned)_clientAliveTimeout);
+        _sessionState = RDPSessionStateDisconnecting;
+        shutdown(_fd, SHUT_RDWR);
+    }
+    os_unfair_lock_unlock(&_fdLock);
 }
 
 - (void)handleMrxMessage:(const mrx_message *)m {
@@ -371,9 +407,11 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
         rdp_info("MACRDPX client \"%.*s\" v%u caps=0x%x -> using 0x%x",
                  (int)m->u.hello.name_length, m->u.hello.name ?: "", m->u.hello.version,
                  m->u.hello.caps, _mrxCaps);
-        if ((_mrxCaps & MRX_CAP_ALIVE) && _clientAliveTimeout)
+        if ((_mrxCaps & MRX_CAP_ALIVE) && _clientAliveTimeout) {
             rdp_info("the client sends ALIVE: ended after %u s without word from it",
                      (unsigned)_clientAliveTimeout);
+            [self startAliveWatchdog];
+        }
         char name[128];
         NSOperatingSystemVersion v = NSProcessInfo.processInfo.operatingSystemVersion;
         snprintf(name, sizeof name, "macos-rdp-server %s; macOS %ld.%ld.%ld", MACOS_RDP_VERSION,
@@ -890,8 +928,11 @@ static void rdp_on_keyframe_request(void *ud) {
         [_display destroy];
     [_mainMode restore];
 
+    if (_aliveWatchdog) { dispatch_source_cancel(_aliveWatchdog); _aliveWatchdog = nil; }
     if (_peer) { rdp_peer_destroy(_peer); _peer = NULL; }
+    os_unfair_lock_lock(&_fdLock);
     if (_fd >= 0) { close(_fd); _fd = -1; }
+    os_unfair_lock_unlock(&_fdLock);
 
     _sessionState = RDPSessionStateDisconnected;
     rdp_info("session torn down for %s", _address.UTF8String);
